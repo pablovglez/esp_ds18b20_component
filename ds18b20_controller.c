@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "rom/ets_sys.h"
+#include "freertos/queue.h"
 
 // GPIO pin for DS18B20 data line
 // Check available pins in gpio_num.h
@@ -28,6 +29,16 @@ static const char *TAG = "DS18B20_CONTROLLER";
 #define ONE_WIRE_READ_SLOT         70
 #define ONE_WIRE_WRITE_SLOT        70
 #define ONE_WIRE_RECOVERY           5
+
+// Message structure for queue
+typedef struct {
+    int temperature;
+    uint32_t delta_t;
+} temp_message_t;
+
+// Global definitions
+QueueHandle_t ds18b20_message_queue = NULL;
+uint32_t temp_timestamp = 0;
 
 /**
  * @brief Set GPIO direction and level
@@ -221,6 +232,14 @@ void ds18b20_init(int gpio_num, int poll_interval_ms)
         .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&io_conf);
+
+    // Create a queue for processing received sentences
+    ds18b20_message_queue = xQueueCreate(10, sizeof(temp_message_t));
+    if (ds18b20_message_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create message queue");
+    } else {
+        ESP_LOGI(TAG, "Message queue created successfully");
+    }
     
     ESP_LOGI(TAG, "DS18B20 initialized on GPIO %d with polling interval %d ms", ONE_WIRE_PIN, POLL_INTERVAL_MS);
 }
@@ -245,10 +264,22 @@ void ds18b20_task(void *pvParameters)
     }
     
     while (1) {
-        float temperature = ds18b20_read_temperature();
+        //float temperature = ds18b20_read_temperature();
+        int temperature = (int)(ds18b20_read_temperature() * 100); // Convert to integer (2 decimal places)
         
-        if (temperature > -100) {
-            ESP_LOGI(TAG, "Temperature: %.2f C", temperature);
+        if (temperature > -10000) {
+            //ESP_LOGI(TAG, "Temperature: %.2f C", temperature / 100.0f);
+            temp_message_t msg;
+            msg.temperature = temperature;
+            int32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            msg.delta_t = current_time - temp_timestamp;
+            temp_timestamp = current_time;
+            // Send to processing queue
+            if (ds18b20_message_queue != NULL) {
+                if (xQueueSend(ds18b20_message_queue, &msg, 0) != pdTRUE) {
+                    ESP_LOGW("UART", "Queue full, message dropped");
+                }
+            }
         } else {
             ESP_LOGE(TAG, "Failed to read temperature");
         }
@@ -256,4 +287,23 @@ void ds18b20_task(void *pvParameters)
         // Read every polling interval
         vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
     }
+}
+
+void temperature_processing_task(void *pvParameters) {
+    temp_message_t msg;
+    while (1) {
+        // Wait for message from queue (blocking)
+        if (xQueueReceive(ds18b20_message_queue, &msg, portMAX_DELAY) == pdTRUE) {
+            // Log the received sentence
+            ESP_LOGI("Temperature", "Received temperature: %.2f C, Delta time: %u ms", 
+                     msg.temperature / 100.0f, msg.delta_t);
+            
+            // Will be pushed to other networking component for sending to server
+            // Thus we need to expose the queue via a getter function
+        }
+    }
+}
+
+QueueHandle_t get_ds18b20_message_queue() {
+    return ds18b20_message_queue;
 }
