@@ -1,11 +1,14 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_intr_alloc.h"
 #include "driver/gpio.h"
 #include "rom/ets_sys.h"
 #include "freertos/queue.h"
+#include "ds18b20_controller.h"
 
 // GPIO pin for DS18B20 data line
 // Check available pins in gpio_num.h
@@ -23,22 +26,23 @@ static const char *TAG = "DS18B20_CONTROLLER";
 #define DS18B20_CMD_RPWRSUPPLY       0xB4
 
 // 1-Wire timing constants (in microseconds)
-#define ONE_WIRE_RESET_PULSE      480
-#define ONE_WIRE_RESET_WAIT        60
-#define ONE_WIRE_PRESENCE_WAIT     240
+#define ONE_WIRE_RESET_PULSE      600 //480
+#define ONE_WIRE_RESET_WAIT        80 //60
+#define ONE_WIRE_PRESENCE_WAIT     320 //240
 #define ONE_WIRE_READ_SLOT         70
 #define ONE_WIRE_WRITE_SLOT        70
 #define ONE_WIRE_RECOVERY           5
+#define MAX_RETRIES 3
 
-// Message structure for queue
-typedef struct {
-    int temperature;
-    uint32_t delta_t;
-} temp_message_t;
+// Floating filter
+#define FILTER_SIZE 5
 
 // Global definitions
 QueueHandle_t ds18b20_message_queue = NULL;
 uint32_t temp_timestamp = 0;
+static float temp_buffer[FILTER_SIZE];
+static uint8_t buffer_index = 0;
+static bool buffer_full = false;
 
 /**
  * @brief Set GPIO direction and level
@@ -72,6 +76,8 @@ static int one_wire_read(void)
 static bool one_wire_reset(void)
 {
     bool presence = false;
+    // Disable interrupts for timing-critical section
+    portDISABLE_INTERRUPTS();
     
     // Pull line low for reset pulse
     one_wire_set_output(0);
@@ -88,6 +94,9 @@ static bool one_wire_reset(void)
     
     // Wait for remainder of presence pulse window
     ets_delay_us(ONE_WIRE_PRESENCE_WAIT - ONE_WIRE_RESET_WAIT);
+    
+    // Re-enable interrupts after timing-critical section
+    portENABLE_INTERRUPTS();
     
     return presence;
 }
@@ -167,11 +176,19 @@ static float ds18b20_read_temperature(void)
     int16_t raw_temp;
     float temp_c;
     
-    // Reset and check for presence
-    if (!one_wire_reset()) {
-        ESP_LOGE(TAG, "No DS18B20 detected");
-        return -999.0f;
+    for (int i = 0; i < MAX_RETRIES; i++) {
+        if (one_wire_reset()) {
+            break;
+        } else {
+            ESP_LOGD(TAG, "DS18B20 not detected, retrying... (%d/%d)", i + 1, MAX_RETRIES);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (i == MAX_RETRIES - 1) {
+            ESP_LOGE(TAG, "Failed to detect DS18B20 after %d attempts", MAX_RETRIES);
+            return -999.0f;
+        }
     }
+    
     
     // Skip ROM (assuming single device)
     one_wire_write_byte(0xCC);
@@ -244,66 +261,83 @@ void ds18b20_init(int gpio_num, int poll_interval_ms)
     ESP_LOGI(TAG, "DS18B20 initialized on GPIO %d with polling interval %d ms", ONE_WIRE_PIN, POLL_INTERVAL_MS);
 }
 
+static float apply_moving_average(float new_temp)
+{
+    temp_buffer[buffer_index] = new_temp;
+    buffer_index = (buffer_index + 1) % FILTER_SIZE;
+    
+    if (!buffer_full && buffer_index == 0) {
+        buffer_full = true;
+    }
+    
+    float sum = 0;
+    uint8_t count = buffer_full ? FILTER_SIZE : buffer_index;
+    
+    for (uint8_t i = 0; i < count; i++) {
+        sum += temp_buffer[i];
+    }
+    
+    return sum / count;
+}
+
 /**
  * @brief Main task for reading DS18B20
  */
 void ds18b20_task(void *pvParameters)
 {
-    // Initialize GPIO
-    //ds18b20_init(ONE_WIRE_PIN);
-    
     // Check for device presence
     vTaskDelay(pdMS_TO_TICKS(100));
     
-    if (!one_wire_reset()) {
-        ESP_LOGE(TAG, "No DS18B20 found on GPIO %d!", ONE_WIRE_PIN);
-        ESP_LOGE(TAG, "Check wiring: VCC->3.3V, GND->GND, DATA->GPIO%d with 4.7k pull-up", 
-                 ONE_WIRE_PIN);
-    } else {
-        ESP_LOGI(TAG, "DS18B20 detected successfully!");
+    for (int i = 0; i < MAX_RETRIES; i++) {
+        if (one_wire_reset()) {
+            ESP_LOGI(TAG, "DS18B20 detected successfully!");
+            break;
+        } else {
+            ESP_LOGD(TAG, "DS18B20 not detected, retrying... (%d/%d)", i + 1, MAX_RETRIES);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (i == MAX_RETRIES - 1) {
+            ESP_LOGE(TAG, "No DS18B20 found on GPIO %d!", ONE_WIRE_PIN);
+            ESP_LOGE(TAG, "Check wiring: VCC->3.3V, GND->GND, DATA->GPIO%d with 4.7k pull-up", 
+                    ONE_WIRE_PIN);
+        }
     }
     
     while (1) {
-        //float temperature = ds18b20_read_temperature();
-        int temperature = (int)(ds18b20_read_temperature() * 100); // Convert to integer (2 decimal places)
-        
-        if (temperature > -10000) {
-            //ESP_LOGI(TAG, "Temperature: %.2f C", temperature / 100.0f);
-            temp_message_t msg;
-            msg.temperature = temperature;
-            int32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            msg.delta_t = current_time - temp_timestamp;
-            temp_timestamp = current_time;
-            // Send to processing queue
-            if (ds18b20_message_queue != NULL) {
-                if (xQueueSend(ds18b20_message_queue, &msg, 0) != pdTRUE) {
-                    ESP_LOGW("UART", "Queue full, message dropped");
+        float raw_temperature = ds18b20_read_temperature();
+
+        if (raw_temperature > -100) { // Valid reading
+            // Apply moving average filter
+            float filtered_temperature = apply_moving_average(raw_temperature);
+            ESP_LOGI(TAG, "Raw temperature: %.2f C", raw_temperature);
+            ESP_LOGI(TAG, "Filtered temperature: %.2f C", filtered_temperature);
+            if (fabs(filtered_temperature - raw_temperature) <= 5.0f){
+                // Log the received sentence
+                int temperature = (int)(raw_temperature * 100);
+                uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                temp_message_t msg;
+                msg.temperature = temperature;
+                msg.delta_t = current_time - temp_timestamp;
+                temp_timestamp = current_time;
+                
+                if (ds18b20_message_queue != NULL) {
+                    if (xQueueSend(ds18b20_message_queue, &msg, 0) != pdTRUE) {
+                        ESP_LOGW(TAG, "Queue full, message dropped");
+                    }
                 }
             }
         } else {
-            ESP_LOGE(TAG, "Failed to read temperature");
+            ESP_LOGE(TAG, "Failed to read temperature (error code: %.0f)", raw_temperature);
         }
         
-        // Read every polling interval
+        
         vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
-    }
 }
 
-void temperature_processing_task(void *pvParameters) {
-    temp_message_t msg;
-    while (1) {
-        // Wait for message from queue (blocking)
-        if (xQueueReceive(ds18b20_message_queue, &msg, portMAX_DELAY) == pdTRUE) {
-            // Log the received sentence
-            ESP_LOGI("Temperature", "Received temperature: %.2f C, Delta time: %u ms", 
-                     msg.temperature / 100.0f, msg.delta_t);
-            
-            // Will be pushed to other networking component for sending to server
-            // Thus we need to expose the queue via a getter function
-        }
+esp_err_t get_ds18b20_queue_message(temp_message_t *msg) {
+    if (xQueueReceive(ds18b20_message_queue, msg, portMAX_DELAY) == pdTRUE) {
+        return ESP_OK;
+    } else {
+        return ESP_FAIL;
     }
-}
-
-QueueHandle_t get_ds18b20_message_queue() {
-    return ds18b20_message_queue;
 }
