@@ -14,6 +14,7 @@
 // Check available pins in gpio_num.h
 int ONE_WIRE_PIN = 4; // Default value, will be overridden by config
 int POLL_INTERVAL_MS = 60000; // Default polling interval (1 minute)
+int TEMP_MESSAGE_VERSION = 1;
 
 static const char *TAG = "DS18B20_CONTROLLER";
 
@@ -287,7 +288,7 @@ void ds18b20_task(void *pvParameters)
 {
     // Check for device presence
     vTaskDelay(pdMS_TO_TICKS(100));
-    
+
     for (int i = 0; i < MAX_RETRIES; i++) {
         if (one_wire_reset()) {
             ESP_LOGI(TAG, "DS18B20 detected successfully!");
@@ -298,11 +299,11 @@ void ds18b20_task(void *pvParameters)
         }
         if (i == MAX_RETRIES - 1) {
             ESP_LOGE(TAG, "No DS18B20 found on GPIO %d!", ONE_WIRE_PIN);
-            ESP_LOGE(TAG, "Check wiring: VCC->3.3V, GND->GND, DATA->GPIO%d with 4.7k pull-up", 
+            ESP_LOGE(TAG, "Check wiring: VCC->3.3V, GND->GND, DATA->GPIO%d with 4.7k pull-up",
                     ONE_WIRE_PIN);
         }
     }
-    
+
     while (1) {
         float raw_temperature = ds18b20_read_temperature();
 
@@ -313,13 +314,16 @@ void ds18b20_task(void *pvParameters)
             ESP_LOGI(TAG, "Filtered temperature: %.2f C", filtered_temperature);
             if (fabs(filtered_temperature - raw_temperature) <= 5.0f){
                 // Log the received sentence
-                int temperature = (int)(raw_temperature * 100);
                 uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
                 temp_message_t msg;
-                msg.temperature = temperature;
+                msg.temperature = filtered_temperature;
+                // DS18B20 Does not provide humidity or luminosity, set to 0
+                msg.humidity = 0.0f;
+                msg.luminosity = 0.0f;
+                msg.struct_version = TEMP_MESSAGE_VERSION;
                 msg.delta_t = current_time - temp_timestamp;
                 temp_timestamp = current_time;
-                
+
                 if (ds18b20_message_queue != NULL) {
                     if (xQueueSend(ds18b20_message_queue, &msg, 0) != pdTRUE) {
                         ESP_LOGW(TAG, "Queue full, message dropped");
@@ -329,9 +333,49 @@ void ds18b20_task(void *pvParameters)
         } else {
             ESP_LOGE(TAG, "Failed to read temperature (error code: %.0f)", raw_temperature);
         }
-        
-        
+    }
         vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+}
+
+void ds18b20_demo_task(void *pvParameters)
+{
+    // Check for device presence
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    ESP_LOGI(TAG, "DS18B20 Demo Task started");// Create a queue for processing received sentences
+    ds18b20_message_queue = xQueueCreate(10, sizeof(temp_message_t));
+    if (ds18b20_message_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create message queue");
+    } else {
+        ESP_LOGI(TAG, "Message queue created successfully");
+    }
+
+    while (1) {
+        // get clock time for randomness
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        temp_message_t msg;
+        // Convert to float
+        msg.temperature = (float)current_time / 500.0f;
+        ESP_LOGI(TAG, "Temperature: %.2f C", msg.temperature);
+        // DS18B20 Does not provide humidity or luminosity, set to 0
+        msg.humidity = 0.0f;
+        msg.luminosity = 0.0f;
+        msg.struct_version = TEMP_MESSAGE_VERSION;
+        msg.delta_t = current_time - temp_timestamp;
+        temp_timestamp = current_time;
+
+        if (ds18b20_message_queue != NULL) {
+            if (xQueueSend(ds18b20_message_queue, &msg, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "Queue full, message dropped");
+            }
+            ESP_LOGI(TAG, "Temperature sent to queue");
+        }
+        else {
+            ESP_LOGW(TAG, "Queue is NULL");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+    }
 }
 
 esp_err_t get_ds18b20_queue_message(temp_message_t *msg) {
